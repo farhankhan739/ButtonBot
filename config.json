@@ -1,9 +1,6 @@
 {
-    "bot_username": "MyAnimeBot",
-    "extra_buttons": [
-        {"text": "📢 Updates", "url": "https://t.me/MyUpdatesChannel"},
-        {"text": "❤️ Support", "url": "https://t.me/MySupportChannel"}
-    ],
+    "bot_username": "AnimeStr_1bot",
+    "extra_buttons": [],
 
     "jjk_ep1480": {
         "message_id": 311
