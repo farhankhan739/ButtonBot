@@ -93,7 +93,8 @@ logger = logging.getLogger(__name__)
     CONFIRM,          # waiting on inline Generate/Preview/Cancel button
     CONFLICT,         # waiting on Continue/Replace/Cancel button
     PREVIEW,          # showing dry-run output, waiting on Generate/Cancel
-) = range(7)
+    SEND_APPROVAL,    # per-episode: Send to Channel / Skip / Stop All
+) = range(8)
 
 # Callback data values
 CB_GENERATE = "gen:generate"
@@ -102,6 +103,9 @@ CB_CANCEL = "gen:cancel"
 CB_CONFLICT_CONTINUE = "gen:conflict_continue"
 CB_CONFLICT_REPLACE = "gen:conflict_replace"
 CB_CONFLICT_CANCEL = "gen:conflict_cancel"
+CB_EP_SEND = "ep:send"
+CB_EP_SKIP = "ep:skip"
+CB_EP_STOP = "ep:stop"
 
 # ---------------------------------------------------------------------------
 # config.json helpers
@@ -180,6 +184,16 @@ def get_pin_setting() -> bool:
     """Configurable via config.json's "pin_generated_messages" key (default False)."""
     config = load_config()
     return bool(config.get("pin_generated_messages", False))
+
+
+def get_post_channel() -> int:
+    """Where episode posts are sent. Falls back to ADMIN_ID (your DM) if not set.
+    Set "post_channel_id" in config.json to send directly to a channel."""
+    config = load_config()
+    channel = config.get("post_channel_id")
+    if channel:
+        return int(channel)
+    return ADMIN_ID
 
 
 def build_episode_plan(short_code: str, num_episodes: int, start_id: int):
@@ -395,8 +409,7 @@ async def confirm_button_pressed(update: Update, context: ContextTypes.DEFAULT_T
 
     # No conflicts -> proceed straight to generation
     await query.edit_message_text("Generating posts...\n\nProgress:\n0 / " + str(len(plan)))
-    await run_generation(update, context, status_message=query.message, mode="append")
-    return ConversationHandler.END
+    return await run_generation(update, context, status_message=query.message, mode="append")
 
 
 async def conflict_button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -411,14 +424,13 @@ async def conflict_button_pressed(update: Update, context: ContextTypes.DEFAULT_
     mode = "continue" if query.data == CB_CONFLICT_CONTINUE else "replace"
     plan = context.user_data["plan"]
     await query.edit_message_text("Generating posts...\n\nProgress:\n0 / " + str(len(plan)))
-    await run_generation(update, context, status_message=query.message, mode=mode)
-    return ConversationHandler.END
+    return await run_generation(update, context, status_message=query.message, mode=mode)
 
 
 # ---------------------------------------------------------------------------
 # Generation (validate -> backup -> write -> send posts) with progress edits
 # ---------------------------------------------------------------------------
-async def run_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, status_message, mode: str) -> None:
+async def run_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, status_message, mode: str) -> int:
     d = context.user_data
     plan = d["plan"]
     anime_name = d["anime_name"]
@@ -440,13 +452,13 @@ async def run_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
         return
 
     # ---- Step: build the new config in memory, then write once ----
-    added, skipped, replaced = 0, 0, 0
+    added, cfg_skipped, replaced = 0, 0, 0
     for ep in plan:
         for q in QUALITIES:
             key = ep["keys"][q]
             exists = key in config
             if exists and mode == "continue":
-                skipped += 1
+                cfg_skipped += 1
                 continue
             if exists and mode == "replace":
                 replaced += 1
@@ -467,18 +479,111 @@ async def run_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
 
     logger.info(
         "config.json updated (mode=%s): %d added, %d replaced, %d skipped",
-        mode, added, replaced, skipped,
+        mode, added, replaced, cfg_skipped,
     )
 
-    # ---- Step: send one message per episode, with throttled progress edits ----
-    extra_row = get_extra_button_row()
-    sent = 0
-    failed = []
-    last_edit_time = 0.0
+    # ---- config.json summary (shown once, stays visible in chat) ----
+    summary_lines = [f"✅ config.json updated: {added} added"]
+    if replaced:
+        summary_lines.append(f"   {replaced} replaced")
+    if cfg_skipped:
+        summary_lines.append(f"   {cfg_skipped} skipped (already existed)")
+    if backup_path:
+        summary_lines.append(f"   Backup: {backup_path.name}")
+    summary_lines.append(f"\nReady to send {total} episode(s) one by one for your approval.")
+    await status_message.edit_text("\n".join(summary_lines))
 
-    for i, ep in enumerate(plan, start=1):
-        n = ep["episode"]
-        text = f"🎬 {anime_name}\n\n📺 Episode {n}\n\nSelect your preferred quality:"
+    # ---- Kick off per-episode approval ----
+    context.user_data["ep_index"] = 0
+    context.user_data["ep_sent"] = 0
+    context.user_data["ep_skipped"] = 0
+    context.user_data["ep_failed"] = []
+    return await show_episode_for_approval(context)
+
+
+async def show_episode_for_approval(context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Send the episode preview (with real URL buttons) + a control prompt to
+    the admin DM. Returns SEND_APPROVAL so the ConversationHandler waits."""
+    d = context.user_data
+    plan = d["plan"]
+    idx = d["ep_index"]
+    total = len(plan)
+
+    if idx >= total:
+        await send_final_summary(context)
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    ep = plan[idx]
+    n = ep["episode"]
+    anime_name = d["anime_name"]
+    bot_username = d["bot_username"]
+    extra_row = get_extra_button_row()
+    template = get_episode_template()
+    post_channel = get_post_channel()
+
+    text = template.format(anime=anime_name, episode=n)
+    quality_row = [
+        InlineKeyboardButton(f"{q}p", url=f"https://t.me/{bot_username}?start={ep['keys'][q]}")
+        for q in QUALITIES
+    ]
+    rows = [quality_row]
+    if extra_row:
+        rows.append(extra_row)
+
+    # 1. Show the exact message that will be posted — with real URL buttons so
+    #    you can tap them to verify the deep links before approving.
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=text,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+    # 2. Control prompt directly below.
+    channel_label = f"channel {post_channel}" if post_channel != ADMIN_ID else "your DM"
+    control_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Send to Channel", callback_data=CB_EP_SEND),
+        InlineKeyboardButton("⏭ Skip",            callback_data=CB_EP_SKIP),
+        InlineKeyboardButton("🛑 Stop",            callback_data=CB_EP_STOP),
+    ]])
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"Episode {n} of {total} — Send to {channel_label}?",
+        reply_markup=control_keyboard,
+    )
+    return SEND_APPROVAL
+
+
+async def episode_approval_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle ✅ Send / ⏭ Skip / 🛑 Stop for each episode."""
+    query = update.callback_query
+    await query.answer()
+
+    d = context.user_data
+    plan = d["plan"]
+    idx = d["ep_index"]
+    ep = plan[idx]
+    n = ep["episode"]
+
+    if query.data == CB_EP_STOP:
+        await query.edit_message_text("🛑 Stopped. No more episodes will be sent.")
+        await send_final_summary(context)
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if query.data == CB_EP_SKIP:
+        await query.edit_message_text(f"⏭ Episode {n} skipped.")
+        d["ep_skipped"] += 1
+
+    elif query.data == CB_EP_SEND:
+        anime_name = d["anime_name"]
+        bot_username = d["bot_username"]
+        extra_row = get_extra_button_row()
+        template = get_episode_template()
+        should_pin = get_pin_setting()
+        post_channel = get_post_channel()
+
+        text = template.format(anime=anime_name, episode=n)
         quality_row = [
             InlineKeyboardButton(f"{q}p", url=f"https://t.me/{bot_username}?start={ep['keys'][q]}")
             for q in QUALITIES
@@ -488,46 +593,46 @@ async def run_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
             rows.append(extra_row)
 
         try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
+            sent_msg = await context.bot.send_message(
+                chat_id=post_channel,
                 text=text,
                 reply_markup=InlineKeyboardMarkup(rows),
             )
-            sent += 1
+            d["ep_sent"] += 1
+            await query.edit_message_text(f"✅ Episode {n} sent to channel.")
+            if should_pin:
+                try:
+                    await context.bot.pin_chat_message(
+                        chat_id=post_channel,
+                        message_id=sent_msg.message_id,
+                        disable_notification=True,
+                    )
+                except Exception as pin_err:
+                    logger.warning("Pinning episode %d failed (skipping): %s", n, pin_err)
         except Exception as e:
-            logger.error("Failed to send post for episode %d: %s", n, e)
-            failed.append(n)
+            logger.error("Failed to send episode %d: %s", n, e)
+            d["ep_failed"].append(n)
+            await query.edit_message_text(f"❌ Episode {n} failed: {e}")
 
-        now = time.monotonic()
-        should_edit = (
-            i == total
-            or i % PROGRESS_UPDATE_EVERY == 0
-        ) and (now - last_edit_time >= PROGRESS_MIN_INTERVAL_SECONDS or i == total)
-        if should_edit:
-            try:
-                await status_message.edit_text(f"Generating posts...\n\nProgress:\n{i} / {total}")
-                last_edit_time = now
-            except Exception as e:
-                # Editing can fail harmlessly (e.g. "message not modified"); never let
-                # a progress-edit failure interrupt actual post generation.
-                logger.debug("Progress edit skipped: %s", e)
+    # Advance to the next episode.
+    d["ep_index"] += 1
+    return await show_episode_for_approval(context)
 
-    # ---- Final status ----
-    final_lines = ["Generation completed successfully.", ""]
-    final_lines.append(
-        f"config.json: {added} added"
-        + (f", {replaced} replaced" if replaced else "")
-        + (f", {skipped} skipped (already existed)" if skipped else "")
-        + "."
-    )
-    if backup_path:
-        final_lines.append(f"Backup saved as: {backup_path.name}")
-    final_lines.append(f"Posts sent: {sent}/{total}.")
+
+async def send_final_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a session summary to the admin DM after all episodes are processed."""
+    d = context.user_data
+    total = len(d.get("plan", []))
+    sent = d.get("ep_sent", 0)
+    skipped = d.get("ep_skipped", 0)
+    failed = d.get("ep_failed", [])
+    lines = [
+        "📋 All done!",
+        f"Total: {total}  |  Sent: {sent}  |  Skipped: {skipped}",
+    ]
     if failed:
-        final_lines.append(f"Failed episodes: {failed}")
-
-    await status_message.edit_text("\n".join(final_lines))
-    context.user_data.clear()
+        lines.append(f"Failed episodes: {failed}")
+    await context.bot.send_message(chat_id=ADMIN_ID, text="\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -556,8 +661,9 @@ def build_app() -> Application:
             SHORT_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, short_code_received)],
             NUM_EPISODES: [MessageHandler(filters.TEXT & ~filters.COMMAND, num_episodes_received)],
             START_MSG_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_msg_id_received)],
-            CONFIRM: [CallbackQueryHandler(confirm_button_pressed, pattern=r"^gen:(generate|cancel)$")],
+            CONFIRM: [CallbackQueryHandler(confirm_button_pressed, pattern=r"^gen:(generate|preview|cancel)$")],
             CONFLICT: [CallbackQueryHandler(conflict_button_pressed, pattern=r"^gen:conflict_")],
+            SEND_APPROVAL: [CallbackQueryHandler(episode_approval_button, pattern=r"^ep:(send|skip|stop)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
